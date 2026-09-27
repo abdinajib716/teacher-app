@@ -1,0 +1,261 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// Every timestamp is timestamptz, stored in UTC and shown in Africa/Mogadishu
+// (src/lib/time.ts). Calendar dates that are not instants (the school day a
+// break belongs to) are plain `date` columns, so no time zone can move them.
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  EXCUSED
+}
+
+enum ExcusedScope {
+  BREAK
+  DAY
+}
+
+enum Language {
+  en
+  so
+}
+
+// ─── Teacher (auth) ───────────────────────────────────────────────────────────
+// The only user of the app. Better Auth owns id, name, email, emailVerified,
+// image and the timestamps; the rest are the teacher's settings.
+//
+// The PRD's password_reset_token / password_reset_expires live in the
+// Verification table, which is where Better Auth stores reset tokens.
+
+model User {
+  id                  String    @id @default(cuid())
+  name                String
+  email               String    @unique
+  emailVerified       Boolean   @default(false)
+  image               String?
+  school              String?
+  language            Language  @default(en)
+  // 0 = Sunday … 6 = Saturday. Default Saturday to Wednesday.
+  schoolDays          Int[]     @default([6, 0, 1, 2, 3])
+  // "HH:MM" in Africa/Mogadishu. They only choose the default break on the
+  // Take Attendance screen: nothing locks.
+  break1Start         String    @default("13:00")
+  break2Start         String    @default("15:00")
+  break2End           String    @default("18:00")
+  lowAttendanceThreshold Int    @default(75)
+  // The SMS sent to a guardian from the message button, with {placeholders}.
+  // Null means the default for the teacher's language (src/lib/message.ts).
+  smsTemplate         String?
+
+  accounts            Account[]
+  sessions            Session[]
+  classes             SchoolClass[]
+  students            Student[]
+  guardians           Guardian[]
+  attendanceSessions  AttendanceSession[]
+  importBatches       ImportBatch[]
+  auditLogs           AuditLog[]
+
+  createdAt           DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@map("teachers")
+}
+
+model Account {
+  id                    String    @id @default(cuid())
+  userId                String
+  accountId             String
+  providerId            String
+  accessToken           String?
+  refreshToken          String?
+  accessTokenExpiresAt  DateTime? @db.Timestamptz(3)
+  refreshTokenExpiresAt DateTime? @db.Timestamptz(3)
+  scope                 String?
+  idToken               String?
+  // bcrypt hash of the teacher's password.
+  password              String?
+  user                  User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt             DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@unique([providerId, accountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+model Session {
+  id        String   @id @default(cuid())
+  userId    String
+  token     String   @unique
+  expiresAt DateTime @db.Timestamptz(3)
+  ipAddress String?
+  userAgent String?
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([userId])
+  @@map("auth_sessions")
+}
+
+// Short-lived tokens issued by Better Auth: password reset links live here.
+model Verification {
+  id         String   @id @default(cuid())
+  identifier String
+  value      String
+  expiresAt  DateTime @db.Timestamptz(3)
+  createdAt  DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @db.Timestamptz(3)
+
+  @@index([identifier])
+  @@map("verifications")
+}
+
+// ─── School data ──────────────────────────────────────────────────────────────
+// Every table carries teacherId and every query filters on it.
+
+model SchoolClass {
+  id                 String              @id @default(cuid())
+  teacherId          String
+  name               String
+  description        String?
+  archived           Boolean             @default(false)
+  teacher            User                @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  students           Student[]
+  attendanceSessions AttendanceSession[]
+  importBatches      ImportBatch[]
+  createdAt          DateTime            @default(now()) @db.Timestamptz(3)
+  updatedAt          DateTime            @updatedAt @db.Timestamptz(3)
+
+  @@index([teacherId, archived])
+  @@map("classes")
+}
+
+model Guardian {
+  id        String    @id @default(cuid())
+  teacherId String
+  name      String
+  phone1    String?
+  phone2    String?
+  archived  Boolean   @default(false)
+  teacher   User      @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  students  Student[]
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+
+  @@index([teacherId, archived])
+  @@index([teacherId, phone1])
+  @@map("guardians")
+}
+
+model Student {
+  id         String             @id @default(cuid())
+  teacherId  String
+  classId    String
+  guardianId String?
+  name       String
+  // Optional, but unique per teacher when present (Postgres lets NULLs repeat).
+  studentNo  String?
+  gender     Gender
+  archived   Boolean            @default(false)
+  teacher    User               @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  class      SchoolClass        @relation(fields: [classId], references: [id], onDelete: Cascade)
+  guardian   Guardian?          @relation(fields: [guardianId], references: [id], onDelete: SetNull)
+  records    AttendanceRecord[]
+  createdAt  DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt  DateTime           @updatedAt @db.Timestamptz(3)
+
+  @@unique([teacherId, studentNo])
+  @@index([teacherId, classId, archived])
+  @@index([guardianId])
+  @@map("students")
+}
+
+// One break of one class on one school day. A second attempt at the same
+// class, date and break opens this row instead of creating another.
+model AttendanceSession {
+  id             String             @id @default(cuid())
+  teacherId      String
+  classId        String
+  sessionDate    DateTime           @db.Date
+  breakNo        Int
+  // Stamped by the server on the first save; never editable.
+  recordedAt     DateTime           @default(now()) @db.Timestamptz(3)
+  // Stamped on every later save.
+  editedAt       DateTime?          @db.Timestamptz(3)
+  pdfGeneratedAt DateTime?          @db.Timestamptz(3)
+  teacher        User               @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  class          SchoolClass        @relation(fields: [classId], references: [id], onDelete: Cascade)
+  records        AttendanceRecord[]
+
+  @@unique([classId, sessionDate, breakNo])
+  @@index([teacherId, sessionDate])
+  @@map("attendance_sessions")
+}
+
+model AttendanceRecord {
+  id           String            @id @default(cuid())
+  sessionId    String
+  studentId    String
+  status       AttendanceStatus
+  // Only meaningful when status is EXCUSED.
+  excusedScope ExcusedScope?
+  note         String?
+  session      AttendanceSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  student      Student           @relation(fields: [studentId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, studentId])
+  @@index([studentId])
+  @@map("attendance_records")
+}
+
+model ImportBatch {
+  id            String       @id @default(cuid())
+  teacherId     String
+  classId       String?
+  fileName      String
+  totalRows     Int
+  importedRows  Int
+  errorRows     Int
+  duplicateRows Int
+  // CSV of the rows that were rejected, with the reason. Null when none were.
+  errorFile     String?
+  teacher       User         @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  class         SchoolClass? @relation(fields: [classId], references: [id], onDelete: SetNull)
+  createdAt     DateTime     @default(now()) @db.Timestamptz(3)
+
+  @@index([teacherId, createdAt])
+  @@map("import_batches")
+}
+
+// The quiet edit history. Written alongside a change, never read on the way
+// to saving one, so it cannot block the teacher.
+model AuditLog {
+  id        String   @id @default(cuid())
+  teacherId String
+  entity    String
+  entityId  String
+  action    String
+  oldValues Json?
+  newValues Json?
+  teacher   User     @relation(fields: [teacherId], references: [id], onDelete: Cascade)
+  changedAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([teacherId, changedAt])
+  @@index([entity, entityId])
+  @@map("audit_logs")
+}
